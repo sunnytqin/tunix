@@ -238,6 +238,22 @@ def _eval_on_gt(code, gt_inputs, gt_outputs, timeout, max_gt):
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def _vprint(verbose, *args, **kwargs):
+    # type: (bool, object, object) -> None
+    if verbose:
+        print(*args, **kwargs)
+
+
+def _vblock(verbose, title, body):
+    # type: (bool, str, str) -> None
+    if not verbose:
+        return
+    sep = "=" * 72
+    print(f"\n{sep}\n  {title}\n{sep}")
+    print(body)
+    print(sep)
+
+
 def run_iterative_eval(
     sampler,
     tokenizer,
@@ -251,8 +267,12 @@ def run_iterative_eval(
     exec_timeout=5.0,
     max_gt_test=5,
     history_turns=1,
+    verbose=False,
 ):
     """Run multi-turn iterative refinement eval.
+
+    Set verbose=True to print every prompt sent to the model and every
+    raw response received, plus the extracted code and test-execution results.
 
     Returns one result dict per problem (None if skipped — prompt too long):
         codes              : list[str|None]         len = n_turns+1
@@ -262,14 +282,18 @@ def run_iterative_eval(
         gt_pass_per_turn   : list[bool]             len = n_turns+1
         gt_detail_per_turn : list[list[bool]]       len = n_turns+1
     """
-    def _sample(prompt: str) -> str:
+    def _sample(prompt, label):
+        # type: (str, str) -> str
+        _vblock(verbose, f"PROMPT  {label}", prompt)
         out = sampler(
             input_strings=[prompt],
             max_generation_steps=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
         )
-        return out.text[0]
+        resp = out.text[0]
+        _vblock(verbose, f"RESPONSE {label}", resp)
+        return resp
 
     results = []
 
@@ -280,6 +304,9 @@ def run_iterative_eval(
         time_limit  = float(prob.get("test_time_limit", 2.0))
         exec_to     = min(exec_timeout, time_limit)
 
+        prob_header = f"PROBLEM {prob_idx+1}/{len(problems)}"
+        _vblock(verbose, prob_header, question[:500] + ("..." if len(question) > 500 else ""))
+
         initial_prompt = CODE_PROMPT_TEMPLATE.format(problem=question)
         if len(tokenizer.encode(initial_prompt)) > max_prompt_len:
             print(f"[{prob_idx+1:3d}/{len(problems)}] SKIP  initial prompt too long")
@@ -287,9 +314,12 @@ def run_iterative_eval(
             continue
 
         # ── Turn 0: initial generation ────────────────────────────────────
-        raw_0  = _sample(initial_prompt)
+        raw_0  = _sample(initial_prompt, f"prob={prob_idx+1} turn=0 SOLVER")
         code_0 = extract_code(raw_0)
         gt_pass_0, gt_detail_0 = _eval_on_gt(code_0, gt_inputs, gt_outputs, exec_to, max_gt_test)
+
+        _vprint(verbose, f"\n  [turn 0] extracted code:\n{code_0}")
+        _vprint(verbose, f"  [turn 0] gt_pass={gt_pass_0}  detail={gt_detail_0}")
 
         codes_hist      = [code_0]
         raw_resp_hist   = [raw_0]
@@ -303,6 +333,7 @@ def run_iterative_eval(
         # ── Turns 1..n_turns ──────────────────────────────────────────────
         for _t in range(1, n_turns + 1):
             if prev_code is None:
+                _vprint(verbose, f"\n  [turn {_t}] prev_code is None — skipping")
                 codes_hist.append(None)
                 raw_resp_hist.append("")
                 gen_tests_hist.append([])
@@ -314,10 +345,13 @@ def run_iterative_eval(
             # -- tester: one call, K tests in a single response ------------
             tester_prompt = build_tester_prompt(question, prev_code, k_case)
             if len(tokenizer.encode(tester_prompt)) > max_prompt_len:
+                _vprint(verbose, f"\n  [turn {_t}] tester prompt too long — skipping tests")
                 valid_tests = []
+                raw_tester = ""
             else:
-                raw_tester  = _sample(tester_prompt)
+                raw_tester  = _sample(tester_prompt, f"prob={prob_idx+1} turn={_t} TESTER")
                 valid_tests = extract_all_test_cases(raw_tester)
+                _vprint(verbose, f"\n  [turn {_t}] tester extracted {len(valid_tests)} test(s)")
 
             gen_tests_hist.append(valid_tests)
 
@@ -327,6 +361,12 @@ def run_iterative_eval(
                 for inp, exp in valid_tests
             ]
             actuals_hist.append(actuals)
+
+            if verbose:
+                for i, (inp, actual, exp) in enumerate(actuals, 1):
+                    match = outputs_match(actual, exp)
+                    print(f"  [turn {_t}] test {i}: {'PASS' if match else 'FAIL'}"
+                          f"  actual={repr(actual.strip()[:60])}  expected={repr(exp.strip()[:60])}")
 
             # -- build multi-turn refine prompt ----------------------------
             context_responses = raw_resp_hist[-history_turns:]
@@ -346,7 +386,7 @@ def run_iterative_eval(
                 refine_prompt = initial_prompt
 
             # -- generate refined code -------------------------------------
-            raw_t  = _sample(refine_prompt)
+            raw_t  = _sample(refine_prompt, f"prob={prob_idx+1} turn={_t} SOLVER")
             code_t = extract_code(raw_t)
 
             codes_hist.append(code_t)
@@ -355,6 +395,9 @@ def run_iterative_eval(
             gt_pass_t, gt_detail_t = _eval_on_gt(code_t, gt_inputs, gt_outputs, exec_to, max_gt_test)
             gt_pass_hist.append(gt_pass_t)
             gt_detail_hist.append(gt_detail_t)
+
+            _vprint(verbose, f"  [turn {_t}] extracted code:\n{code_t}")
+            _vprint(verbose, f"  [turn {_t}] gt_pass={gt_pass_t}  detail={gt_detail_t}")
 
             prev_code = code_t
 
