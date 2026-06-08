@@ -267,20 +267,33 @@ def run_iterative_eval(
     exec_timeout=5.0,
     max_gt_test=5,
     history_turns=1,
+    gt_solutions=None,
     verbose=False,
 ):
     """Run multi-turn iterative refinement eval.
+
+    gt_solutions: optional dict mapping task_id (str or int) to a Python solution
+      string.  When provided and a problem's ``task_id`` key matches an entry,
+      the GT solution is executed on each tester-generated input and its output
+      is compared against the tester's predicted output.  This measures tester
+      accuracy without requiring the solver to be correct first.
+      Raises RuntimeError if the GT solution errors or times out on any generated
+      input — that indicates a bad data entry that should be fixed or removed.
 
     Set verbose=True to print every prompt sent to the model and every
     raw response received, plus the extracted code and test-execution results.
 
     Returns one result dict per problem (None if skipped — prompt too long):
-        codes              : list[str|None]         len = n_turns+1
-        raw_responses      : list[str]              len = n_turns+1
-        gen_tests          : list[list[tuple]]       len = n_turns
-        actuals            : list[list[tuple]]       len = n_turns
-        gt_pass_per_turn   : list[bool]             len = n_turns+1
-        gt_detail_per_turn : list[list[bool]]       len = n_turns+1
+        codes                 : list[str|None]        len = n_turns+1
+        raw_responses         : list[str]             len = n_turns+1
+        gen_tests             : list[list[tuple]]      len = n_turns
+        actuals               : list[list[tuple]]      len = n_turns
+        gt_pass_per_turn      : list[bool]            len = n_turns+1
+        gt_detail_per_turn    : list[list[bool]]      len = n_turns+1
+        gt_solution_used      : bool
+        tester_vs_gt_per_turn : list[list[bool]]      len = n_turns
+          Per generated test: True if tester predicted output matches GT output.
+          Only populated when gt_solutions is provided and task_id is present.
     """
     def _sample(prompt, label):
         # type: (str, str) -> str
@@ -288,6 +301,7 @@ def run_iterative_eval(
         out = sampler(
             input_strings=[prompt],
             max_generation_steps=max_new_tokens,
+            max_prompt_length=max_prompt_len,
             temperature=temperature,
             top_p=top_p,
         )
@@ -303,6 +317,13 @@ def run_iterative_eval(
         gt_outputs  = prob["test_output"]
         time_limit  = float(prob.get("test_time_limit", 2.0))
         exec_to     = min(exec_timeout, time_limit)
+
+        # Look up GT solution for this problem (task_id may be int or str in the dict).
+        gt_sol = None
+        if gt_solutions is not None:
+            task_id = prob.get("task_id")
+            if task_id is not None:
+                gt_sol = gt_solutions.get(str(task_id)) or gt_solutions.get(task_id)
 
         prob_header = f"PROBLEM {prob_idx+1}/{len(problems)}"
         _vblock(verbose, prob_header, question[:500] + ("..." if len(question) > 500 else ""))
@@ -321,12 +342,13 @@ def run_iterative_eval(
         _vprint(verbose, f"\n  [turn 0] extracted code:\n{code_0}")
         _vprint(verbose, f"  [turn 0] gt_pass={gt_pass_0}  detail={gt_detail_0}")
 
-        codes_hist      = [code_0]
-        raw_resp_hist   = [raw_0]
-        gen_tests_hist  = []
-        actuals_hist    = []
-        gt_pass_hist    = [gt_pass_0]
-        gt_detail_hist  = [gt_detail_0]
+        codes_hist           = [code_0]
+        raw_resp_hist        = [raw_0]
+        gen_tests_hist       = []
+        actuals_hist         = []
+        gt_pass_hist         = [gt_pass_0]
+        gt_detail_hist       = [gt_detail_0]
+        tester_vs_gt_hist    = []
 
         prev_code = code_0
 
@@ -340,6 +362,7 @@ def run_iterative_eval(
                 actuals_hist.append([])
                 gt_pass_hist.append(False)
                 gt_detail_hist.append([])
+                tester_vs_gt_hist.append([])
                 continue
 
             # -- tester: one call, K tests in a single response ------------
@@ -357,16 +380,31 @@ def run_iterative_eval(
 
             # -- execute current code on each generated test ---------------
             actuals = [
-                (inp, run_code(prev_code, inp, exec_to), exp)
-                for inp, exp in valid_tests
+                (inp, run_code(prev_code, inp, exec_to), tester_exp)
+                for inp, tester_exp in valid_tests
             ]
             actuals_hist.append(actuals)
+
+            # -- evaluate tester accuracy against GT solution (metrics only) --
+            tester_vs_gt = []
+            if gt_sol is not None:
+                for inp, tester_exp in valid_tests:
+                    gt_out = run_code(gt_sol, inp, exec_to)
+                    if gt_out == "timeout" or gt_out.startswith("error:"):
+                        raise RuntimeError(
+                            f"GT solution failed on generated input for prob={prob_idx+1} "
+                            f"turn={_t}: {gt_out!r}\ninput={inp!r}\n"
+                            "Fix or remove this data entry."
+                        )
+                    tester_vs_gt.append(outputs_match(tester_exp, gt_out))
+            tester_vs_gt_hist.append(tester_vs_gt)
 
             if verbose:
                 for i, (inp, actual, exp) in enumerate(actuals, 1):
                     match = outputs_match(actual, exp)
+                    gt_label = f"  gt_match={tester_vs_gt[i-1]}" if tester_vs_gt else ""
                     print(f"  [turn {_t}] test {i}: {'PASS' if match else 'FAIL'}"
-                          f"  actual={repr(actual.strip()[:60])}  expected={repr(exp.strip()[:60])}")
+                          f"  actual={repr(actual.strip()[:60])}  expected={repr(exp.strip()[:60])}{gt_label}")
 
             # -- build multi-turn refine prompt ----------------------------
             context_responses = raw_resp_hist[-history_turns:]
@@ -402,12 +440,14 @@ def run_iterative_eval(
             prev_code = code_t
 
         results.append({
-            "codes":              codes_hist,
-            "raw_responses":      raw_resp_hist,
-            "gen_tests":          gen_tests_hist,
-            "actuals":            actuals_hist,
-            "gt_pass_per_turn":   gt_pass_hist,
-            "gt_detail_per_turn": gt_detail_hist,
+            "codes":                  codes_hist,
+            "raw_responses":          raw_resp_hist,
+            "gen_tests":              gen_tests_hist,
+            "actuals":                actuals_hist,
+            "gt_pass_per_turn":       gt_pass_hist,
+            "gt_detail_per_turn":     gt_detail_hist,
+            "gt_solution_used":       gt_sol is not None,
+            "tester_vs_gt_per_turn":  tester_vs_gt_hist,
         })
 
         traj = "  ".join(
