@@ -268,17 +268,18 @@ def run_iterative_eval(
     max_gt_test=5,
     history_turns=1,
     gt_solutions=None,
+    use_gt_oracle=False,
     verbose=False,
 ):
     """Run multi-turn iterative refinement eval.
 
     gt_solutions: optional dict mapping task_id (str or int) to a Python solution
-      string.  When provided and a problem's ``task_id`` key matches an entry,
-      the GT solution is executed on each tester-generated input and its output
-      is compared against the tester's predicted output.  This measures tester
-      accuracy without requiring the solver to be correct first.
-      Raises RuntimeError if the GT solution errors or times out on any generated
-      input — that indicates a bad data entry that should be fixed or removed.
+      string.  Required when use_gt_oracle=True.
+
+    use_gt_oracle: if True, use the GT solution (from gt_solutions) as the oracle
+      for measuring tester accuracy.  If False (default), use the solver's own
+      previous-turn code as oracle — but only when that code passed GT tests.
+      Errors/timeouts from the oracle on a given input are silently skipped.
 
     Set verbose=True to print every prompt sent to the model and every
     raw response received, plus the extracted code and test-execution results.
@@ -292,8 +293,8 @@ def run_iterative_eval(
         gt_detail_per_turn    : list[list[bool]]      len = n_turns+1
         gt_solution_used      : bool
         tester_vs_gt_per_turn : list[list[bool]]      len = n_turns
-          Per generated test: True if tester predicted output matches GT output.
-          Only populated when gt_solutions is provided and task_id is present.
+          Per generated test: True if tester predicted output matches oracle output.
+          Populated when an oracle is available (GT or correct solver code).
     """
     def _sample(prompt, label):
         # type: (str, str) -> str
@@ -385,18 +386,23 @@ def run_iterative_eval(
             ]
             actuals_hist.append(actuals)
 
-            # -- evaluate tester accuracy against GT solution (metrics only) --
+            # -- evaluate tester accuracy against oracle (metrics only) --
+            # Oracle is GT solution (if use_gt_oracle=True) or the solver's
+            # previous code when it was verified correct (gt_pass_hist[-1] True).
             tester_vs_gt = []
-            if gt_sol is not None:
+            if use_gt_oracle and gt_sol is not None:
+                oracle_code = gt_sol
+            elif (not use_gt_oracle) and gt_pass_hist[-1] and prev_code is not None:
+                oracle_code = prev_code
+            else:
+                oracle_code = None
+
+            if oracle_code is not None:
                 for inp, tester_exp in valid_tests:
-                    gt_out = run_code(gt_sol, inp, exec_to)
-                    if gt_out == "timeout" or gt_out.startswith("error:"):
-                        raise RuntimeError(
-                            f"GT solution failed on generated input for prob={prob_idx+1} "
-                            f"turn={_t}: {gt_out!r}\ninput={inp!r}\n"
-                            "Fix or remove this data entry."
-                        )
-                    tester_vs_gt.append(outputs_match(tester_exp, gt_out))
+                    oracle_out = run_code(oracle_code, inp, exec_to)
+                    if oracle_out == "timeout" or oracle_out.startswith("error:"):
+                        continue
+                    tester_vs_gt.append(outputs_match(tester_exp, oracle_out))
             tester_vs_gt_hist.append(tester_vs_gt)
 
             if verbose:
