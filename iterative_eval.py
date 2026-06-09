@@ -12,9 +12,12 @@ tokenizer as arguments, so it can be imported without JAX being installed.
 
 import ctypes
 import io
+import json
+import os
 import re
 import sys
 import threading
+import time
 import typing
 from typing import Dict, List, Optional, Tuple
 
@@ -236,6 +239,44 @@ def _eval_on_gt(code, gt_inputs, gt_outputs, timeout, max_gt):
     return (bool(detail) and all(detail)), detail
 
 
+def _load_checkpoint(path):
+    # type: (Optional[str]) -> dict
+    if path and os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_checkpoint(path, ckpt):
+    # type: (Optional[str], dict) -> None
+    if not path:
+        return
+    with open(path, "w") as f:
+        json.dump(ckpt, f, indent=2)
+
+
+def _result_to_json(result):
+    """Convert a result dict to a JSON-serialisable form (tuples → lists)."""
+    if result is None:
+        return None
+    return {
+        **result,
+        "gen_tests":  [[list(tc) for tc in turn] for turn in result["gen_tests"]],
+        "actuals":    [[list(tc) for tc in turn] for turn in result["actuals"]],
+    }
+
+
+def _result_from_json(entry):
+    """Restore tuples in gen_tests and actuals after loading from JSON."""
+    if entry is None:
+        return None
+    return {
+        **entry,
+        "gen_tests": [[(t[0], t[1]) for t in turn] for turn in entry["gen_tests"]],
+        "actuals":   [[(t[0], t[1], t[2]) for t in turn] for turn in entry["actuals"]],
+    }
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def _vprint(verbose, *args, **kwargs):
@@ -269,6 +310,7 @@ def run_iterative_eval(
     history_turns=1,
     gt_solutions=None,
     use_gt_oracle=False,
+    checkpoint_path=None,
     verbose=False,
 ):
     """Run multi-turn iterative refinement eval.
@@ -281,21 +323,40 @@ def run_iterative_eval(
       previous-turn code as oracle — but only when that code passed GT tests.
       Errors/timeouts from the oracle on a given input are silently skipped.
 
+    checkpoint_path: if set, results are saved to this JSON file after each
+      problem and loaded on entry so interrupted runs can resume.
+
     Set verbose=True to print every prompt sent to the model and every
     raw response received, plus the extracted code and test-execution results.
 
     Returns one result dict per problem (None if skipped — prompt too long):
-        codes                 : list[str|None]        len = n_turns+1
-        raw_responses         : list[str]             len = n_turns+1
-        gen_tests             : list[list[tuple]]      len = n_turns
-        actuals               : list[list[tuple]]      len = n_turns
-        gt_pass_per_turn      : list[bool]            len = n_turns+1
-        gt_detail_per_turn    : list[list[bool]]      len = n_turns+1
+        task_id               : str|int|None
+        question_preview      : str              first 200 chars of the question
+        timestamp             : float            unix time when the problem finished
+        codes                 : list[str|None]   len = n_turns+1
+        raw_solver_responses  : list[str]        len = n_turns+1
+        raw_tester_responses  : list[str]        len = n_turns  ('' if skipped)
+        prompts_sent          : dict
+            initial           : str
+            tester            : list[str]        len = n_turns
+            refine            : list[str]        len = n_turns
+        gen_tests             : list[list[tuple]] len = n_turns
+        actuals               : list[list[tuple]] len = n_turns
+        gt_pass_per_turn      : list[bool]       len = n_turns+1
+        gt_detail_per_turn    : list[list[bool]] len = n_turns+1
         gt_solution_used      : bool
-        tester_vs_gt_per_turn : list[list[bool]]      len = n_turns
+        tester_vs_gt_per_turn : list[list[bool]] len = n_turns
           Per generated test: True if tester predicted output matches oracle output.
           Populated when an oracle is available (GT or correct solver code).
     """
+    checkpoint = _load_checkpoint(checkpoint_path)
+    if checkpoint:
+        print(f"Checkpoint loaded: {len(checkpoint)} problem(s) already done.")
+
+    def _ckpt_key(prob_idx, prob):
+        task_id = prob.get("task_id")
+        return str(task_id) if task_id is not None else str(prob_idx)
+
     def _sample(prompt, label):
         # type: (str, str) -> str
         _vblock(verbose, f"PROMPT  {label}", prompt)
@@ -313,16 +374,33 @@ def run_iterative_eval(
     results = []
 
     for prob_idx, prob in enumerate(problems):
+        ckpt_key = _ckpt_key(prob_idx, prob)
+
+        # ── resume from checkpoint ────────────────────────────────────────
+        if ckpt_key in checkpoint:
+            entry = checkpoint[ckpt_key]
+            results.append(_result_from_json(entry))
+            status = "SKIP (prompt too long)" if entry is None else entry.get("gt_pass_per_turn", [])
+            if entry is None:
+                traj = "SKIPPED"
+            else:
+                traj = "  ".join(
+                    ("PASS" if p else "FAIL") + f"(t{i})"
+                    for i, p in enumerate(entry["gt_pass_per_turn"])
+                )
+            print(f"[{prob_idx+1:3d}/{len(problems)}] RESUMED  {traj}")
+            continue
+
         question    = prob["question"]
         gt_inputs   = prob["test_input"]
         gt_outputs  = prob["test_output"]
         time_limit  = float(prob.get("test_time_limit", 2.0))
         exec_to     = min(exec_timeout, time_limit)
+        task_id     = prob.get("task_id")
 
         # Look up GT solution for this problem (task_id may be int or str in the dict).
         gt_sol = None
         if gt_solutions is not None:
-            task_id = prob.get("task_id")
             if task_id is not None:
                 gt_sol = gt_solutions.get(str(task_id)) or gt_solutions.get(task_id)
 
@@ -333,6 +411,8 @@ def run_iterative_eval(
         if len(tokenizer.encode(initial_prompt)) > max_prompt_len:
             print(f"[{prob_idx+1:3d}/{len(problems)}] SKIP  initial prompt too long")
             results.append(None)
+            checkpoint[ckpt_key] = None
+            _save_checkpoint(checkpoint_path, checkpoint)
             continue
 
         # ── Turn 0: initial generation ────────────────────────────────────
@@ -343,13 +423,16 @@ def run_iterative_eval(
         _vprint(verbose, f"\n  [turn 0] extracted code:\n{code_0}")
         _vprint(verbose, f"  [turn 0] gt_pass={gt_pass_0}  detail={gt_detail_0}")
 
-        codes_hist           = [code_0]
-        raw_resp_hist        = [raw_0]
-        gen_tests_hist       = []
-        actuals_hist         = []
-        gt_pass_hist         = [gt_pass_0]
-        gt_detail_hist       = [gt_detail_0]
-        tester_vs_gt_hist    = []
+        codes_hist              = [code_0]
+        raw_solver_resp_hist    = [raw_0]
+        raw_tester_resp_hist    = []
+        tester_prompts_hist     = []
+        refine_prompts_hist     = []
+        gen_tests_hist          = []
+        actuals_hist            = []
+        gt_pass_hist            = [gt_pass_0]
+        gt_detail_hist          = [gt_detail_0]
+        tester_vs_gt_hist       = []
 
         prev_code = code_0
 
@@ -358,7 +441,10 @@ def run_iterative_eval(
             if prev_code is None:
                 _vprint(verbose, f"\n  [turn {_t}] prev_code is None — skipping")
                 codes_hist.append(None)
-                raw_resp_hist.append("")
+                raw_solver_resp_hist.append("")
+                raw_tester_resp_hist.append("")
+                tester_prompts_hist.append("")
+                refine_prompts_hist.append("")
                 gen_tests_hist.append([])
                 actuals_hist.append([])
                 gt_pass_hist.append(False)
@@ -368,6 +454,7 @@ def run_iterative_eval(
 
             # -- tester: one call, K tests in a single response ------------
             tester_prompt = build_tester_prompt(question, prev_code, k_case)
+            tester_prompts_hist.append(tester_prompt)
             if len(tokenizer.encode(tester_prompt)) > max_prompt_len:
                 _vprint(verbose, f"\n  [turn {_t}] tester prompt too long — skipping tests")
                 valid_tests = []
@@ -377,6 +464,7 @@ def run_iterative_eval(
                 valid_tests = extract_all_test_cases(raw_tester)
                 _vprint(verbose, f"\n  [turn {_t}] tester extracted {len(valid_tests)} test(s)")
 
+            raw_tester_resp_hist.append(raw_tester)
             gen_tests_hist.append(valid_tests)
 
             # -- execute current code on each generated test ---------------
@@ -413,7 +501,7 @@ def run_iterative_eval(
                           f"  actual={repr(actual.strip()[:60])}  expected={repr(exp.strip()[:60])}{gt_label}")
 
             # -- build multi-turn refine prompt ----------------------------
-            context_responses = raw_resp_hist[-history_turns:]
+            context_responses = raw_solver_resp_hist[-history_turns:]
             if actuals:
                 refine_prompt = build_refine_prompt(initial_prompt, context_responses, actuals)
                 # If too long, drop test cases from the end one by one
@@ -429,12 +517,14 @@ def run_iterative_eval(
             else:
                 refine_prompt = initial_prompt
 
+            refine_prompts_hist.append(refine_prompt)
+
             # -- generate refined code -------------------------------------
             raw_t  = _sample(refine_prompt, f"prob={prob_idx+1} turn={_t} SOLVER")
             code_t = extract_code(raw_t)
 
             codes_hist.append(code_t)
-            raw_resp_hist.append(raw_t)
+            raw_solver_resp_hist.append(raw_t)
 
             gt_pass_t, gt_detail_t = _eval_on_gt(code_t, gt_inputs, gt_outputs, exec_to, max_gt_test)
             gt_pass_hist.append(gt_pass_t)
@@ -445,16 +535,28 @@ def run_iterative_eval(
 
             prev_code = code_t
 
-        results.append({
-            "codes":                  codes_hist,
-            "raw_responses":          raw_resp_hist,
-            "gen_tests":              gen_tests_hist,
-            "actuals":                actuals_hist,
-            "gt_pass_per_turn":       gt_pass_hist,
-            "gt_detail_per_turn":     gt_detail_hist,
-            "gt_solution_used":       gt_sol is not None,
-            "tester_vs_gt_per_turn":  tester_vs_gt_hist,
-        })
+        result = {
+            "task_id":               task_id,
+            "question_preview":      question[:200],
+            "timestamp":             time.time(),
+            "codes":                 codes_hist,
+            "raw_solver_responses":  raw_solver_resp_hist,
+            "raw_tester_responses":  raw_tester_resp_hist,
+            "prompts_sent": {
+                "initial": initial_prompt,
+                "tester":  tester_prompts_hist,
+                "refine":  refine_prompts_hist,
+            },
+            "gen_tests":             gen_tests_hist,
+            "actuals":               actuals_hist,
+            "gt_pass_per_turn":      gt_pass_hist,
+            "gt_detail_per_turn":    gt_detail_hist,
+            "gt_solution_used":      gt_sol is not None,
+            "tester_vs_gt_per_turn": tester_vs_gt_hist,
+        }
+        results.append(result)
+        checkpoint[ckpt_key] = _result_to_json(result)
+        _save_checkpoint(checkpoint_path, checkpoint)
 
         traj = "  ".join(
             ("PASS" if p else "FAIL") + f"(t{i})"
