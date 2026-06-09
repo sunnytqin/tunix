@@ -221,20 +221,26 @@ def _format_oracle_feedback(failures):
     return "\n".join(lines) + "\n"
 
 
-def build_oracle_refine_prompt(initial_prompt, prev_raw_responses, failures):
-    # type: (str, List[str], List[Tuple[str, str, str]]) -> str
-    """Build refine prompt using GT test feedback.
+def build_oracle_refine_prompt(initial_prompt, history_pairs, latest_resp, current_failures):
+    # type: (str, List[Tuple[str, str]], str, List[Tuple[str, str, str]]) -> str
+    """Build oracle-tester refine prompt as a proper multi-turn conversation.
 
-    failures: list of (inp, actual, expected) triples for failed cases.
-      Pass an empty list when the code is correct.
+    history_pairs: older (solver_resp, feedback_msg) pairs, oldest first.
+      Each pair is one complete exchange: the code the solver wrote and the
+      feedback message it received that caused the next refinement.
+    latest_resp: the solver's most recent response (no feedback assigned yet).
+    current_failures: (inp, actual, expected) triples for this turn's feedback.
     """
     parts = [initial_prompt]
-    for resp in prev_raw_responses:
+    for resp, feedback_msg in history_pairs:
         parts.append(resp)
         parts.append("<|im_end|>\n")
-    if failures:
+        parts.append(f"<|im_start|>User: {feedback_msg}<|im_end|>\n<|im_start|>Assistant: ")
+    parts.append(latest_resp)
+    parts.append("<|im_end|>\n")
+    if current_failures:
         msg = SOLVER_ORACLE_FEEDBACK_TEMPLATE.format(
-            feedback_block=_format_oracle_feedback(failures)
+            feedback_block=_format_oracle_feedback(current_failures)
         )
     else:
         msg = SOLVER_ORACLE_CORRECT_MESSAGE
@@ -738,8 +744,10 @@ def run_oracle_iterative_eval(
 
         codes_hist           = [code_0]
         raw_solver_resp_hist = [raw_0]
+        feedback_msgs_hist   = []   # fm[i] is the feedback that caused raw_solver_resp_hist[i+1]
         refine_prompts_hist  = []
         failures_shown_hist  = []
+        trimmed_hist         = []   # bool per turn: True if history was trimmed to fit context
         gt_pass_hist         = [gt_pass_0]
         gt_detail_hist       = [gt_detail_0]
 
@@ -752,6 +760,7 @@ def run_oracle_iterative_eval(
                 raw_solver_resp_hist.append("")
                 refine_prompts_hist.append("")
                 failures_shown_hist.append([])
+                trimmed_hist.append(False)
                 gt_pass_hist.append(False)
                 gt_detail_hist.append([])
                 continue
@@ -764,24 +773,37 @@ def run_oracle_iterative_eval(
                 if not outputs_match(actual, exp):
                     all_failures.append((inp, actual, exp))
 
-            # Sample failures to show (random subset if more than max_failures_shown)
+            # Sample failures to show
             if len(all_failures) > max_failures_shown:
                 shown_failures = rng.sample(all_failures, max_failures_shown)
             else:
                 shown_failures = list(all_failures)
             failures_shown_hist.append(shown_failures)
 
-            # Build refine prompt
-            context_responses = raw_solver_resp_hist[-history_turns:]
-            refine_prompt = build_oracle_refine_prompt(initial_prompt, context_responses, shown_failures)
-            # Trim if too long
-            while len(tokenizer.encode(refine_prompt)) > max_prompt_len and shown_failures:
-                shown_failures = shown_failures[:-1]
-                refine_prompt = build_oracle_refine_prompt(initial_prompt, context_responses, shown_failures)
+            # Build (code, feedback) pair history; drop oldest pairs if over
+            # the token limit — failures are never trimmed.
+            n_pairs = max(0, history_turns - 1)
+            all_pairs = list(zip(raw_solver_resp_hist[:-1], feedback_msgs_hist))
+            pairs_to_use   = all_pairs[-n_pairs:] if n_pairs > 0 else []
+            latest_resp_ctx = raw_solver_resp_hist[-1]
+
+            refine_prompt = build_oracle_refine_prompt(
+                initial_prompt, pairs_to_use, latest_resp_ctx, shown_failures
+            )
+            trimmed = False
+            while len(tokenizer.encode(refine_prompt)) > max_prompt_len and pairs_to_use:
+                pairs_to_use = pairs_to_use[1:]   # drop oldest (code, feedback) pair
+                trimmed = True
+                refine_prompt = build_oracle_refine_prompt(
+                    initial_prompt, pairs_to_use, latest_resp_ctx, shown_failures
+                )
+            trimmed_hist.append(trimmed)
+            if trimmed:
+                _vprint(verbose, f"  [turn {_t}] history trimmed to fit context "
+                                 f"({len(pairs_to_use)} pair(s) kept)")
             refine_prompts_hist.append(refine_prompt)
 
             if not all_failures:
-                # Code is correct — no need to call solver again
                 _vprint(verbose, f"\n  [turn {_t}] all GT tests pass — early stop")
                 break
 
@@ -789,6 +811,12 @@ def run_oracle_iterative_eval(
             raw_t  = _sample(refine_prompt, f"prob={prob_idx+1} turn={_t} SOLVER")
             code_t = extract_code(raw_t)
 
+            # Store the feedback message that caused this refinement
+            feedback_msgs_hist.append(
+                SOLVER_ORACLE_FEEDBACK_TEMPLATE.format(
+                    feedback_block=_format_oracle_feedback(shown_failures)
+                )
+            )
             codes_hist.append(code_t)
             raw_solver_resp_hist.append(raw_t)
 
@@ -811,6 +839,7 @@ def run_oracle_iterative_eval(
                 "refine":  refine_prompts_hist,
             },
             "failures_shown_per_turn": failures_shown_hist,
+            "trimmed_per_turn":        trimmed_hist,
             "gt_pass_per_turn":        gt_pass_hist,
             "gt_detail_per_turn":      gt_detail_hist,
         }
