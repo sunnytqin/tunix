@@ -14,9 +14,11 @@ import ctypes
 import io
 import json
 import os
+import random
 import re
 import sys
 import threading
+import time
 import typing
 from typing import Dict, List, Optional, Tuple
 
@@ -59,6 +61,18 @@ SOLVER_REFINE_FEEDBACK_TEMPLATE = (
     "{feedback_block}"
     "Please review your solution. If you believe your code is correct and the expected outputs "
     "are wrong, you may keep it unchanged. Otherwise, identify the bug and write an improved solution.\n"
+)
+
+# Oracle-tester variants: GT test cases are guaranteed correct.
+SOLVER_ORACLE_CORRECT_MESSAGE = (
+    "Your code passed all the test cases. Great work — no changes are needed."
+)
+
+SOLVER_ORACLE_FEEDBACK_TEMPLATE = (
+    "The following test cases were run against your code and produced incorrect output. "
+    "These test cases are guaranteed to be correct.\n\n"
+    "{feedback_block}"
+    "Please identify the bug in your solution and write an improved solution.\n"
 )
 
 # ── Utilities (verbatim from notebook cells) ──────────────────────────────────
@@ -195,6 +209,39 @@ def _format_feedback(actuals):
     return "\n".join(lines) + "\n"
 
 
+def _format_oracle_feedback(failures):
+    # type: (List[Tuple[str, str, str]]) -> str
+    lines = []
+    for i, (inp, actual, expected) in enumerate(failures, 1):
+        lines.append(f"Test {i}:")
+        lines.append(f"  Input:\n{_indent(inp)}")
+        lines.append(f"  Your output:     {actual.strip()}")
+        lines.append(f"  Expected output: {expected.strip()}")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def build_oracle_refine_prompt(initial_prompt, prev_raw_responses, failures):
+    # type: (str, List[str], List[Tuple[str, str, str]]) -> str
+    """Build refine prompt using GT test feedback.
+
+    failures: list of (inp, actual, expected) triples for failed cases.
+      Pass an empty list when the code is correct.
+    """
+    parts = [initial_prompt]
+    for resp in prev_raw_responses:
+        parts.append(resp)
+        parts.append("<|im_end|>\n")
+    if failures:
+        msg = SOLVER_ORACLE_FEEDBACK_TEMPLATE.format(
+            feedback_block=_format_oracle_feedback(failures)
+        )
+    else:
+        msg = SOLVER_ORACLE_CORRECT_MESSAGE
+    parts.append(f"<|im_start|>User: {msg}<|im_end|>\n<|im_start|>Assistant: ")
+    return "".join(parts)
+
+
 def build_tester_prompt(problem, code, k_case):
     # type: (str, str, int) -> str
     return TESTER_TARGETED_TEMPLATE.format(problem=problem, code=code, k_case=k_case)
@@ -273,6 +320,30 @@ def _result_from_json(entry):
         **entry,
         "gen_tests": [[(t[0], t[1]) for t in turn] for turn in entry["gen_tests"]],
         "actuals":   [[(t[0], t[1], t[2]) for t in turn] for turn in entry["actuals"]],
+    }
+
+
+def _oracle_result_to_json(result):
+    if result is None:
+        return None
+    return {
+        **result,
+        "failures_shown_per_turn": [
+            [list(tc) for tc in turn]
+            for turn in result["failures_shown_per_turn"]
+        ],
+    }
+
+
+def _oracle_result_from_json(entry):
+    if entry is None:
+        return None
+    return {
+        **entry,
+        "failures_shown_per_turn": [
+            [tuple(tc) for tc in turn]
+            for turn in entry["failures_shown_per_turn"]
+        ],
     }
 
 
@@ -555,6 +626,196 @@ def run_iterative_eval(
         }
         results.append(result)
         checkpoint[ckpt_key] = _result_to_json(result)
+        _save_checkpoint(checkpoint_path, checkpoint)
+
+        traj = "  ".join(
+            ("PASS" if p else "FAIL") + f"(t{i})"
+            for i, p in enumerate(gt_pass_hist)
+        )
+        print(f"[{prob_idx+1:3d}/{len(problems)}] {traj}")
+
+    return results
+
+
+def run_oracle_iterative_eval(
+    sampler,
+    tokenizer,
+    problems,
+    n_turns=2,
+    max_failures_shown=3,
+    max_new_tokens=1024,
+    max_prompt_len=7168,
+    temperature=0.8,
+    top_p=0.95,
+    exec_timeout=5.0,
+    max_gt_test=5,
+    history_turns=1,
+    checkpoint_path=None,
+    verbose=False,
+    rng_seed=42,
+):
+    """Oracle-tester iterative refinement eval.
+
+    At each turn the solver's code is run against ground-truth test cases.
+    Failing cases (up to max_failures_shown, randomly sampled) are fed back
+    with guaranteed-correct expected outputs.  If all tests pass the solver is
+    told its code is correct and the loop terminates early.
+
+    Returns one result dict per problem (None if skipped — prompt too long):
+        task_id                  : str|int|None
+        question_preview         : str
+        timestamp                : float
+        codes                    : list[str|None]  len <= n_turns+1
+        raw_solver_responses     : list[str]
+        prompts_sent             : {initial: str, refine: list[str]}
+        failures_shown_per_turn  : list[list[tuple]]  (inp, actual, expected)
+        gt_pass_per_turn         : list[bool]   len <= n_turns+1
+        gt_detail_per_turn       : list[list[bool]]
+    """
+    rng = random.Random(rng_seed)
+    checkpoint = _load_checkpoint(checkpoint_path)
+    if checkpoint:
+        print(f"Checkpoint loaded: {len(checkpoint)} problem(s) already done.")
+
+    def _ckpt_key(prob_idx, prob):
+        task_id = prob.get("task_id")
+        return str(task_id) if task_id is not None else str(prob_idx)
+
+    def _sample(prompt, label):
+        _vblock(verbose, f"PROMPT  {label}", prompt)
+        out = sampler(
+            input_strings=[prompt],
+            max_generation_steps=max_new_tokens,
+            max_prompt_length=max_prompt_len,
+            temperature=temperature,
+            top_p=top_p,
+        )
+        resp = out.text[0]
+        _vblock(verbose, f"RESPONSE {label}", resp)
+        return resp
+
+    results = []
+
+    for prob_idx, prob in enumerate(problems):
+        ckpt_key = _ckpt_key(prob_idx, prob)
+
+        if ckpt_key in checkpoint:
+            entry = checkpoint[ckpt_key]
+            results.append(_oracle_result_from_json(entry))
+            if entry is None:
+                traj = "SKIPPED"
+            else:
+                traj = "  ".join(
+                    ("PASS" if p else "FAIL") + f"(t{i})"
+                    for i, p in enumerate(entry["gt_pass_per_turn"])
+                )
+            print(f"[{prob_idx+1:3d}/{len(problems)}] RESUMED  {traj}")
+            continue
+
+        question   = prob["question"]
+        gt_inputs  = prob["test_input"]
+        gt_outputs = prob["test_output"]
+        time_limit = float(prob.get("test_time_limit", 2.0))
+        exec_to    = min(exec_timeout, time_limit)
+        task_id    = prob.get("task_id")
+
+        _vblock(verbose, f"PROBLEM {prob_idx+1}/{len(problems)}", question[:500])
+
+        initial_prompt = CODE_PROMPT_TEMPLATE.format(problem=question)
+        if len(tokenizer.encode(initial_prompt)) > max_prompt_len:
+            print(f"[{prob_idx+1:3d}/{len(problems)}] SKIP  initial prompt too long")
+            results.append(None)
+            checkpoint[ckpt_key] = None
+            _save_checkpoint(checkpoint_path, checkpoint)
+            continue
+
+        # Turn 0: initial generation
+        raw_0  = _sample(initial_prompt, f"prob={prob_idx+1} turn=0 SOLVER")
+        code_0 = extract_code(raw_0)
+        gt_pass_0, gt_detail_0 = _eval_on_gt(code_0, gt_inputs, gt_outputs, exec_to, max_gt_test)
+
+        _vprint(verbose, f"\n  [turn 0] gt_pass={gt_pass_0}  detail={gt_detail_0}")
+
+        codes_hist           = [code_0]
+        raw_solver_resp_hist = [raw_0]
+        refine_prompts_hist  = []
+        failures_shown_hist  = []
+        gt_pass_hist         = [gt_pass_0]
+        gt_detail_hist       = [gt_detail_0]
+
+        prev_code = code_0
+
+        for _t in range(1, n_turns + 1):
+            if prev_code is None:
+                _vprint(verbose, f"\n  [turn {_t}] prev_code is None — skipping")
+                codes_hist.append(None)
+                raw_solver_resp_hist.append("")
+                refine_prompts_hist.append("")
+                failures_shown_hist.append([])
+                gt_pass_hist.append(False)
+                gt_detail_hist.append([])
+                continue
+
+            # Run code against GT tests, collect failures
+            n_gt = min(len(gt_inputs), max_gt_test)
+            all_failures = []
+            for inp, exp in zip(gt_inputs[:n_gt], gt_outputs[:n_gt]):
+                actual = run_code(prev_code, inp, exec_to)
+                if not outputs_match(actual, exp):
+                    all_failures.append((inp, actual, exp))
+
+            # Sample failures to show (random subset if more than max_failures_shown)
+            if len(all_failures) > max_failures_shown:
+                shown_failures = rng.sample(all_failures, max_failures_shown)
+            else:
+                shown_failures = list(all_failures)
+            failures_shown_hist.append(shown_failures)
+
+            # Build refine prompt
+            context_responses = raw_solver_resp_hist[-history_turns:]
+            refine_prompt = build_oracle_refine_prompt(initial_prompt, context_responses, shown_failures)
+            # Trim if too long
+            while len(tokenizer.encode(refine_prompt)) > max_prompt_len and shown_failures:
+                shown_failures = shown_failures[:-1]
+                refine_prompt = build_oracle_refine_prompt(initial_prompt, context_responses, shown_failures)
+            refine_prompts_hist.append(refine_prompt)
+
+            if not all_failures:
+                # Code is correct — no need to call solver again
+                _vprint(verbose, f"\n  [turn {_t}] all GT tests pass — early stop")
+                break
+
+            # Generate refined code
+            raw_t  = _sample(refine_prompt, f"prob={prob_idx+1} turn={_t} SOLVER")
+            code_t = extract_code(raw_t)
+
+            codes_hist.append(code_t)
+            raw_solver_resp_hist.append(raw_t)
+
+            gt_pass_t, gt_detail_t = _eval_on_gt(code_t, gt_inputs, gt_outputs, exec_to, max_gt_test)
+            gt_pass_hist.append(gt_pass_t)
+            gt_detail_hist.append(gt_detail_t)
+
+            _vprint(verbose, f"  [turn {_t}] gt_pass={gt_pass_t}  detail={gt_detail_t}")
+
+            prev_code = code_t
+
+        result = {
+            "task_id":               task_id,
+            "question_preview":      question[:200],
+            "timestamp":             time.time(),
+            "codes":                 codes_hist,
+            "raw_solver_responses":  raw_solver_resp_hist,
+            "prompts_sent": {
+                "initial": initial_prompt,
+                "refine":  refine_prompts_hist,
+            },
+            "failures_shown_per_turn": failures_shown_hist,
+            "gt_pass_per_turn":        gt_pass_hist,
+            "gt_detail_per_turn":      gt_detail_hist,
+        }
+        results.append(result)
+        checkpoint[ckpt_key] = _oracle_result_to_json(result)
         _save_checkpoint(checkpoint_path, checkpoint)
 
         traj = "  ".join(
