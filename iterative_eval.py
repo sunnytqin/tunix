@@ -378,7 +378,7 @@ def run_iterative_eval(
     n_turns=2,
     k_case=3,
     max_new_tokens=1024,
-    max_prompt_len=7168,
+    max_prompt_len=None,
     temperature=0.8,
     top_p=0.95,
     exec_timeout=5.0,
@@ -425,6 +425,8 @@ def run_iterative_eval(
           Per generated test: True if tester predicted output matches oracle output.
           Populated when an oracle is available (GT or correct solver code).
     """
+    if max_prompt_len is None:
+        raise ValueError("max_prompt_len must be set explicitly (e.g. MAX_CACHE_LEN - MAX_NEW_TOKENS - 1)")
     checkpoint = _load_checkpoint(checkpoint_path)
     if checkpoint:
         print(f"Checkpoint loaded: {len(checkpoint)} problem(s) already done.")
@@ -650,7 +652,7 @@ def run_oracle_iterative_eval(
     n_turns=2,
     max_failures_shown=3,
     max_new_tokens=1024,
-    max_prompt_len=7168,
+    max_prompt_len=None,
     temperature=0.8,
     top_p=0.95,
     exec_timeout=5.0,
@@ -678,6 +680,8 @@ def run_oracle_iterative_eval(
         gt_pass_per_turn         : list[bool]   len <= n_turns+1
         gt_detail_per_turn       : list[list[bool]]
     """
+    if max_prompt_len is None:
+        raise ValueError("max_prompt_len must be set explicitly (e.g. MAX_CACHE_LEN - MAX_NEW_TOKENS - 1)")
     rng = random.Random(rng_seed)
     checkpoint = _load_checkpoint(checkpoint_path)
     if checkpoint:
