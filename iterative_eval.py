@@ -75,6 +75,10 @@ SOLVER_ORACLE_FEEDBACK_TEMPLATE = (
     "Please identify the bug in your solution and write an improved solution.\n"
 )
 
+SOLVER_BLIND_FEEDBACK_MESSAGE = (
+    "Your solution is incorrect. Please review your approach and write a different solution."
+)
+
 # ── Utilities (verbatim from notebook cells) ──────────────────────────────────
 
 _exec_lock = threading.Lock()
@@ -244,6 +248,22 @@ def build_oracle_refine_prompt(initial_prompt, history_pairs, latest_resp, curre
         )
     else:
         msg = SOLVER_ORACLE_CORRECT_MESSAGE
+    parts.append(f"<|im_start|>User: {msg}<|im_end|>\n<|im_start|>Assistant: ")
+    return "".join(parts)
+
+
+def build_blind_refine_prompt(initial_prompt, history_pairs, latest_resp, passed):
+    # type: (str, List[Tuple[str, str]], str, bool) -> str
+    """Build blind refine prompt: same multi-turn structure as oracle, but feedback
+    is binary (pass/fail) with no test-case details shown."""
+    parts = [initial_prompt]
+    for resp, feedback_msg in history_pairs:
+        parts.append(resp)
+        parts.append("<|im_end|>\n")
+        parts.append(f"<|im_start|>User: {feedback_msg}<|im_end|>\n<|im_start|>Assistant: ")
+    parts.append(latest_resp)
+    parts.append("<|im_end|>\n")
+    msg = SOLVER_ORACLE_CORRECT_MESSAGE if passed else SOLVER_BLIND_FEEDBACK_MESSAGE
     parts.append(f"<|im_start|>User: {msg}<|im_end|>\n<|im_start|>Assistant: ")
     return "".join(parts)
 
@@ -849,6 +869,200 @@ def run_oracle_iterative_eval(
         }
         results.append(result)
         checkpoint[ckpt_key] = _oracle_result_to_json(result)
+        _save_checkpoint(checkpoint_path, checkpoint)
+
+        traj = "  ".join(
+            ("PASS" if p else "FAIL") + f"(t{i})"
+            for i, p in enumerate(gt_pass_hist)
+        )
+        print(f"[{prob_idx+1:3d}/{len(problems)}] {traj}")
+
+    return results
+
+
+def run_blind_iterative_eval(
+    sampler,
+    tokenizer,
+    problems,
+    n_turns=2,
+    max_new_tokens=1024,
+    max_prompt_len=None,
+    temperature=0.8,
+    top_p=0.95,
+    exec_timeout=5.0,
+    max_gt_test=5,
+    history_turns=1,
+    checkpoint_path=None,
+    verbose=False,
+):
+    """Blind iterative refinement eval.
+
+    At each turn the solver's code is run against ground-truth test cases.
+    If all pass, the solver is told its code is correct and the loop stops early.
+    If any fail, the solver is told only that its solution is incorrect — no
+    test-case details are revealed.  Full conversation history is kept (with the
+    same oldest-pair trimming as oracle eval when the prompt exceeds the limit).
+
+    Compared against pass@K this isolates whether multi-turn iteration helps
+    beyond what independent re-sampling would achieve.
+
+    Returns one result dict per problem (None if skipped — prompt too long):
+        task_id              : str|int|None
+        question_preview     : str
+        timestamp            : float
+        codes                : list[str|None]   len <= n_turns+1
+        raw_solver_responses : list[str]
+        prompts_sent         : {initial: str, refine: list[str]}
+        gt_pass_per_turn     : list[bool]       len <= n_turns+1
+        gt_detail_per_turn   : list[list[bool]]
+        trimmed_per_turn     : list[bool]
+    """
+    if max_prompt_len is None:
+        raise ValueError("max_prompt_len must be set explicitly (e.g. MAX_CACHE_LEN - MAX_NEW_TOKENS - 1)")
+    checkpoint = _load_checkpoint(checkpoint_path)
+    if checkpoint:
+        print(f"Checkpoint loaded: {len(checkpoint)} problem(s) already done.")
+
+    def _ckpt_key(prob_idx, prob):
+        task_id = prob.get("task_id")
+        return str(task_id) if task_id is not None else str(prob_idx)
+
+    def _sample(prompt, label):
+        _vblock(verbose, f"PROMPT  {label}", prompt)
+        out = sampler(
+            input_strings=[prompt],
+            max_generation_steps=max_new_tokens,
+            max_prompt_length=max_prompt_len,
+            temperature=temperature,
+            top_p=top_p,
+        )
+        resp = out.text[0]
+        _vblock(verbose, f"RESPONSE {label}", resp)
+        return resp
+
+    results = []
+
+    for prob_idx, prob in enumerate(problems):
+        ckpt_key = _ckpt_key(prob_idx, prob)
+
+        if ckpt_key in checkpoint:
+            entry = checkpoint[ckpt_key]
+            results.append(entry)  # no tuple fields to restore
+            if entry is None:
+                traj = "SKIPPED"
+            else:
+                traj = "  ".join(
+                    ("PASS" if p else "FAIL") + f"(t{i})"
+                    for i, p in enumerate(entry["gt_pass_per_turn"])
+                )
+            print(f"[{prob_idx+1:3d}/{len(problems)}] RESUMED  {traj}")
+            continue
+
+        question   = prob["question"]
+        gt_inputs  = prob["test_input"]
+        gt_outputs = prob["test_output"]
+        time_limit = float(prob.get("test_time_limit", 2.0))
+        exec_to    = min(exec_timeout, time_limit)
+        task_id    = prob.get("task_id")
+
+        _vblock(verbose, f"PROBLEM {prob_idx+1}/{len(problems)}", question[:500])
+
+        initial_prompt = CODE_PROMPT_TEMPLATE.format(problem=question)
+        if len(tokenizer.encode(initial_prompt)) > max_prompt_len:
+            print(f"[{prob_idx+1:3d}/{len(problems)}] SKIP  initial prompt too long")
+            results.append(None)
+            checkpoint[ckpt_key] = None
+            _save_checkpoint(checkpoint_path, checkpoint)
+            continue
+
+        # Turn 0: initial generation
+        raw_0  = _sample(initial_prompt, f"prob={prob_idx+1} turn=0 SOLVER")
+        code_0 = extract_code(raw_0)
+        gt_pass_0, gt_detail_0 = _eval_on_gt(code_0, gt_inputs, gt_outputs, exec_to, max_gt_test)
+
+        _vprint(verbose, f"\n  [turn 0] gt_pass={gt_pass_0}  detail={gt_detail_0}")
+
+        codes_hist           = [code_0]
+        raw_solver_resp_hist = [raw_0]
+        feedback_msgs_hist   = []   # fm[i] caused raw_solver_resp_hist[i+1]
+        refine_prompts_hist  = []
+        trimmed_hist         = []
+        gt_pass_hist         = [gt_pass_0]
+        gt_detail_hist       = [gt_detail_0]
+
+        prev_code = code_0
+
+        for _t in range(1, n_turns + 1):
+            if prev_code is None:
+                _vprint(verbose, f"\n  [turn {_t}] prev_code is None — skipping")
+                codes_hist.append(None)
+                raw_solver_resp_hist.append("")
+                refine_prompts_hist.append("")
+                trimmed_hist.append(False)
+                gt_pass_hist.append(False)
+                gt_detail_hist.append([])
+                continue
+
+            # Run against GT tests (binary pass/fail — no details revealed to solver)
+            gt_pass_check, _ = _eval_on_gt(prev_code, gt_inputs, gt_outputs, exec_to, max_gt_test)
+
+            n_pairs = max(0, history_turns - 1)
+            all_pairs = list(zip(raw_solver_resp_hist[:-1], feedback_msgs_hist))
+            pairs_to_use    = all_pairs[-n_pairs:] if n_pairs > 0 else []
+            latest_resp_ctx = raw_solver_resp_hist[-1]
+
+            refine_prompt = build_blind_refine_prompt(
+                initial_prompt, pairs_to_use, latest_resp_ctx, gt_pass_check
+            )
+            trimmed = False
+            while len(tokenizer.encode(refine_prompt)) > max_prompt_len and pairs_to_use:
+                pairs_to_use = pairs_to_use[1:]
+                trimmed = True
+                refine_prompt = build_blind_refine_prompt(
+                    initial_prompt, pairs_to_use, latest_resp_ctx, gt_pass_check
+                )
+            trimmed_hist.append(trimmed)
+            if trimmed:
+                _vprint(verbose, f"  [turn {_t}] history trimmed to fit context "
+                                 f"({len(pairs_to_use)} pair(s) kept)")
+            refine_prompts_hist.append(refine_prompt)
+
+            if gt_pass_check:
+                _vprint(verbose, f"\n  [turn {_t}] all GT tests pass — early stop")
+                break
+
+            feedback_msgs_hist.append(SOLVER_BLIND_FEEDBACK_MESSAGE)
+
+            raw_t  = _sample(refine_prompt, f"prob={prob_idx+1} turn={_t} SOLVER")
+            code_t = extract_code(raw_t)
+
+            codes_hist.append(code_t)
+            raw_solver_resp_hist.append(raw_t)
+
+            gt_pass_t, gt_detail_t = _eval_on_gt(code_t, gt_inputs, gt_outputs, exec_to, max_gt_test)
+            gt_pass_hist.append(gt_pass_t)
+            gt_detail_hist.append(gt_detail_t)
+
+            _vprint(verbose, f"  [turn {_t}] gt_pass={gt_pass_t}  detail={gt_detail_t}")
+
+            prev_code = code_t
+
+        result = {
+            "task_id":              task_id,
+            "question_preview":     question[:200],
+            "timestamp":            time.time(),
+            "codes":                codes_hist,
+            "raw_solver_responses": raw_solver_resp_hist,
+            "prompts_sent": {
+                "initial": initial_prompt,
+                "refine":  refine_prompts_hist,
+            },
+            "gt_pass_per_turn":   gt_pass_hist,
+            "gt_detail_per_turn": gt_detail_hist,
+            "trimmed_per_turn":   trimmed_hist,
+        }
+        results.append(result)
+        checkpoint[ckpt_key] = result
         _save_checkpoint(checkpoint_path, checkpoint)
 
         traj = "  ".join(
